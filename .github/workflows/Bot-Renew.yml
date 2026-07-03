@@ -1,0 +1,249 @@
+name: Bot-Hosting-Renew
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '51 01 * * *'
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable unzip xvfb libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libgbm1 libasound2t64 libatspi2.0-0 libxshmfence1 fonts-liberation libxrender1 libxtst6
+          python -m pip install --upgrade pip
+          pip install DrissionPage requests pysocks
+
+      - name: Restore Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: browser_profile
+          key: browser-profile-${{ github.run_id }}
+          restore-keys: browser-profile-
+
+      - name: Setup Proxy
+        env:
+          PROXY_NODE: ${{ secrets.PROXY_NODE }}
+          PARSE_NODE_PY: |
+            import os, sys, json, base64
+            from urllib.parse import parse_qs, unquote
+            
+            def mask(s):
+                return f"{s[:2]}***{s[-2:]}" if len(s) > 4 else "****"
+            
+            url = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+            if not url: sys.exit(1)
+            
+            protocol = ""
+            if url.startswith("vless://"): protocol = "vless"; content = url[8:]
+            elif url.startswith("vmess://"): protocol = "vmess"; content = url[8:]
+            elif url.startswith("trojan://"): protocol = "trojan"; content = url[9:]
+            elif url.startswith("ss://"): protocol = "ss"; content = url[5:]
+            elif url.startswith("hysteria2://") or url.startswith("hy2://"): protocol = "hysteria2"; content = url.split("://")[1]
+            elif url.startswith("socks"):
+                print(f"[INFO] SOCKS5 -> {mask(url)}")
+                with open("use_external_socks.txt", "w") as f: f.write(url.split("#")[0])
+                sys.exit(0)
+            else:
+                print(f"[WARN] 暂不支持的协议: {url.split('://')[0]}")
+                sys.exit(1)
+            
+            if "#" in content: content = content.rsplit("#", 1)[0]
+            
+            config = {
+                "log": {"level": "warn"},
+                "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 1080}],
+                "outbounds": []
+            }
+            
+            if protocol == "vless":
+                uuid, rest = content.split("@", 1)
+                host_port, p_str = rest.split("?", 1) if "?" in rest else (rest, "")
+                address, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
+                p = parse_qs(p_str)
+                flow = p.get("flow", [""])[0]
+                network = p.get("type", ["tcp"])[0]
+                security = p.get("security", ["none"])[0]
+                sni = p.get("sni", [address])[0]
+                fp = p.get("fp", ["chrome"])[0]
+                pbk = p.get("pbk", [""])[0]
+                sid = p.get("sid", [""])[0] or p.get("shortId", [""])[0]
+                path = unquote(p.get("path", ["/"])[0])
+                host = p.get("host", [sni])[0]
+                outbound = {"type": "vless", "tag": "proxy-out", "server": address, "server_port": int(port), "uuid": uuid}
+                if flow: outbound["flow"] = flow
+                if security in ["reality", "tls"]:
+                    outbound["tls"] = {"enabled": True, "server_name": sni, "utls": {"enabled": True, "fingerprint": fp if fp else "chrome"}}
+                    if security == "reality":
+                        outbound["tls"]["reality"] = {"enabled": True, "public_key": pbk, "short_id": sid}
+                if network == "ws":
+                    outbound["transport"] = {"type": "ws", "path": path, "headers": {"Host": host}}
+                config["outbounds"].append(outbound)
+                print(f"[INFO] VLESS 解析成功 -> {mask(address)}:{port}")
+            
+            elif protocol == "vmess":
+                try:
+                    padding = 4 - len(content) % 4
+                    if padding != 4: content += "=" * padding
+                    vm = json.loads(base64.b64decode(content).decode("utf-8"))
+                except Exception as e:
+                    print(f"[ERROR] VMess 解码失败: {e}"); sys.exit(1)
+                address = vm.get("add", ""); port = int(vm.get("port", 443))
+                uuid = vm.get("id", ""); aid = int(vm.get("aid", 0))
+                network = vm.get("net", "tcp"); tls = vm.get("tls", "")
+                sni = vm.get("sni", "") or vm.get("host", address)
+                host = vm.get("host", address); path = vm.get("path", "/"); fp = vm.get("fp", "chrome")
+                outbound = {"type": "vmess", "tag": "proxy-out", "server": address, "server_port": port, "uuid": uuid, "security": "auto", "alter_id": aid}
+                if tls == "tls":
+                    outbound["tls"] = {"enabled": True, "server_name": sni, "utls": {"enabled": True, "fingerprint": fp if fp else "chrome"}}
+                if network == "ws":
+                    outbound["transport"] = {"type": "ws", "path": path, "headers": {"Host": host}}
+                config["outbounds"].append(outbound)
+                print(f"[INFO] VMess 解析成功 -> {mask(address)}:{port}")
+            
+            # 其他协议简化处理
+            else:
+                print(f"[INFO] {protocol} 协议使用简化处理")
+                config["outbounds"].append({"type": "proxy-out", "tag": "proxy-out"})
+            
+            config["outbounds"].append({"type": "direct", "tag": "direct-out"})
+            with open("singbox_config.json", "w") as f:
+                json.dump(config, f, indent=2)
+            print("[INFO] ✅ sing-box 配置生成完成")
+        run: |
+          if [ -z "$PROXY_NODE" ]; then
+            echo "[INFO] 未配置代理，直连模式"
+            exit 0
+          fi
+          echo "$PROXY_NODE" | grep -v '^\s*$' | grep -v '^\s*#' > proxy_nodes.txt
+          NODE_COUNT=$(wc -l < proxy_nodes.txt)
+          echo "[INFO] 共读取到 $NODE_COUNT 条节点"
+          if [ "$NODE_COUNT" -eq 0 ]; then exit 0; fi
+
+          LATEST_TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$LATEST_TAG" ]; then LATEST_TAG="v1.10.7"; fi
+          VERSION=$(echo $LATEST_TAG | sed 's/^v//')
+          echo "[INFO] 正在下载 sing-box ${LATEST_TAG}..."
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${VERSION}-linux-amd64.tar.gz"
+          tar -xzf "sing-box-${VERSION}-linux-amd64.tar.gz"
+          mv "sing-box-${VERSION}-linux-amd64/sing-box" ./sing-box
+          chmod +x sing-box
+
+          # 这里安全地将环境变量里的 Python 代码导入文件，避免所有的 Bash 和 YAML 缩进坑
+          echo "$PARSE_NODE_PY" > parse_node.py
+
+          # 执行代理节点测试
+          NODE_INDEX=0
+          PROXY_OK=false
+          while IFS= read -r NODE_URL; do
+            NODE_INDEX=$((NODE_INDEX + 1))
+            echo "[INFO] 尝试节点 $NODE_INDEX / $NODE_COUNT"
+            rm -f singbox_config.json use_external_socks.txt singbox.log
+            pkill -f "sing-box" || true
+            sleep 1
+            if ! python3 parse_node.py "$NODE_URL"; then
+              echo "[WARN] 节点解析失败，跳过"
+              continue
+            fi
+            if [ -f "use_external_socks.txt" ]; then
+              EXTERNAL_SOCKS=$(cat use_external_socks.txt)
+              if curl -x "$EXTERNAL_SOCKS" -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
+                echo "PROXY_SERVER=$EXTERNAL_SOCKS" >> $GITHUB_ENV
+                PROXY_OK=true
+                break
+              fi
+            else
+              ./sing-box run -c singbox_config.json > singbox.log 2>&1 &
+              sleep 5
+              CONNECTED=false
+              for i in 1 2 3; do
+                if curl -x socks5://127.0.0.1:1080 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
+                  CONNECTED=true
+                  break
+                fi
+                sleep 3
+              done
+              if $CONNECTED; then
+                echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+                PROXY_OK=true
+                break
+              fi
+            fi
+          done < proxy_nodes.txt
+
+          if $PROXY_OK; then
+            echo "[INFO] 🎉 代理配置完成"
+          else
+            echo "[WARN] 所有节点失败，使用直连"
+            pkill -f "sing-box" || true
+          fi
+
+      - name: Run Renewal Script
+        env:
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY: ${{ env.PROXY_SERVER }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python -u main.py | tee main.log
+
+      - name: Update Next Cron Schedule (冷却结束 + 5分钟)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          echo "🔄 正在计算下次运行时间..."
+          REMAINING=$(grep -oE 'Renew in ([0-9]{1,2}):([0-9]{2}):([0-9]{2})' -r . --include="*.log" --include="*.txt" 2>/dev/null | head -n1 || echo "")
+          if [ -n "$REMAINING" ]; then
+            H=$(echo "$REMAINING" | grep -oE '[0-9]+:' | head -n1 | tr -d ':')
+            M=$(echo "$REMAINING" | grep -oE ':[0-9]{2}:' | head -n1 | tr -d ':' | sed 's/^0//')
+            S=$(echo "$REMAINING" | grep -oE '[0-9]{2}$' | head -n1)
+            TOTAL_SEC=$(( ${H:-0}*3600 + ${M:-0}*60 + ${S:-0} ))
+            TRIGGER_SEC=$(( TOTAL_SEC + 300 ))
+            NEXT_MIN=$(date -u -d "+${TRIGGER_SEC} seconds" "+%M")
+            NEXT_HOUR=$(date -u -d "+${TRIGGER_SEC} seconds" "+%H")
+            NEW_CRON="${NEXT_MIN} ${NEXT_HOUR} * * *"
+            echo "下次运行 (UTC): ${NEXT_HOUR}:${NEXT_MIN} → ${NEW_CRON}"
+            
+            # 👇 这里已修复正则表达式！限制只能匹配 - cron: 开头的行，防止代码误伤自身！
+            sed -i "s/^[[:space:]]*- cron: .*/    - cron: '${NEW_CRON}'/" .github/workflows/Bot-Hosting-Renew.yml
+            
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/workflows/Bot-Hosting-Renew.yml
+            if git diff --staged --quiet; then
+              echo "cron 未变化"
+            else
+              git commit -m "chore: 动态更新下次续期时间 → ${NEW_CRON} (结束+5分钟)"
+              git push
+              echo "✅ cron 已更新并推送"
+            fi
+          else
+            echo "⚠️ 未检测到 Renew in 倒计时"
+          fi
+
+      - name: Upload Debug Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-logs-and-screenshots
+          path: |
+            *.png
+            singbox.log
+            *.log
+            *.txt
+          retention-days: 3
