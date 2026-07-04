@@ -1,346 +1,377 @@
-import os
-import re
-import sys
-import time
-import random
-import requests
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, re, sys, time, requests, subprocess
 from datetime import datetime
-from DrissionPage import ChromiumPage, ChromiumOptions
+from seleniumbase import SB
 
-# ─────────────────────────────────────────────
-# 工具函数
-# ─────────────────────────────────────────────
-def log(msg: str):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+# 环境变量配置(可以直接私库在双引号里填写)
+EMAIL         = os.environ.get("EMAIL") or "xxxxx@gmail.com"   # 邮箱,只用于通知使用，可随意填写
+SESSION_TOKEN = os.environ.get("SESSION_TOKEN") or ""          # session token，必须填写
+GH_TOKEN      = os.environ.get("GH_TOKEN") or ""               # GitHub PAT token,用于自动更新session token,必须填写
+TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""             # TG chat id,不填写不通知，需和bot token一起填写生效
+TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""           # TG bot token 
 
-def send_tg_photo(token: str, chat_id: str, photo_path: str, caption: str = ""):
-    if not token or not chat_id: 
-        return
-    caption = caption[:1020]
-    if os.path.exists(photo_path):
-        try:
-            url = f"https://api.telegram.org/bot{token}/sendPhoto"
-            with open(photo_path, 'rb') as f:
-                resp = requests.post(url, data={'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'}, 
-                                   files={'photo': f}, timeout=25)
-            if resp.status_code == 200:
-                log(f"📤 Telegram 截图已发送: {os.path.basename(photo_path)}")
-                os.remove(photo_path)
-                return
-        except Exception as e:
-            log(f"⚠️ 图片发送异常: {e}")
-    send_tg_text(token, chat_id, caption)
+if not SESSION_TOKEN :
+    print("ℹ️ 未配置 SESSION_TOKEN,脚本终止。")
+    sys.exit(1)
 
-def send_tg_text(token: str, chat_id: str, text: str):
-    if not token or not chat_id: 
-        return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"}, timeout=15)
-    except Exception:
-        pass
+# 构造cookie
+COOKIES = {
+    "session_token": SESSION_TOKEN,
+    "login": "true",
+    "theme": "system",
+}
 
-def parse_accounts(raw: str) -> list[tuple[str, str]]:
-    accounts = []
-    for line in re.split(r'[\n,]+', raw.strip()):
-        line = line.strip()
-        if '---' in line:
-            parts = line.split('---', 1)
-            if len(parts) == 2:
-                accounts.append((parts[0].strip(), parts[1].strip()))
-    return accounts
+# 获取cookie到期时间
+def get_cookie_info(sb, name):
+    cookies = sb.get_cookies()
+    for c in cookies:
+        if c.get('name') == name:
+            value = c.get('value')
+            expiry_ts = c.get('expiry')
+            expiry_dt = datetime.fromtimestamp(expiry_ts) if expiry_ts else None
+            return value, expiry_dt
+    return None, None
 
-def _screenshot(page: ChromiumPage, path: str) -> str:
-    try:
-        page.get_screenshot(path=path)
-        log(f"📸 截图已保存: {path}")
-    except Exception:
-        pass
-    return path
-
-# ─────────────────────────────────────────────
-# Turnstile 破解器
-# ─────────────────────────────────────────────
-class TurnstileSolver:
-    def __init__(self, page: ChromiumPage):
-        self.page = page
-
-    def solve(self, timeout: int = 15) -> bool:
-        try:
-            for _ in range(3):
-                iframe = self.page.get_frame('css:iframe[src^="https://challenges.cloudflare.com"]', timeout=3)
-                if iframe:
-                    log("🛡️ 检测到 Cloudflare Turnstile 验证码，正在处理...")
-                    try:
-                        iframe.frame_ele.click.at(offset_x=random.randint(20, 30), offset_y=random.randint(20, 30))
-                    except:
-                        pass
-                    time.sleep(4)
-                    break
-        except:
-            pass
+# 检查是否需要更新cookie
+def should_update_cookie(new_value, old_value, expiry_dt, days_threshold=3):
+    if new_value is None:
+        return False
+    if new_value != old_value:
         return True
+    if expiry_dt:
+        remaining = (expiry_dt - datetime.now()).total_seconds()
+        if remaining < days_threshold * 24 * 3600:
+            return True
+    return False
 
-# ─────────────────────────────────────────────
-# 主类
-# ─────────────────────────────────────────────
-class BotHostingRenewer:
-    BASE_URL = "https://bot-hosting.net"
-    LOGIN_URL = "https://bot-hosting.net/login"
-    NEW_PANEL_URL = "https://bot-hosting.net/a"
-    BILLING_URL = "https://bot-hosting.net/a/billings"
-
-    def __init__(self, email: str, token: str, proxy: str = "", tg_token: str = "", tg_chat_id: str = ""):
-        self.email = email
-        self.discord_token = token
-        self.proxy = proxy
-        self.tg_token = tg_token
-        self.tg_chat_id = tg_chat_id
-        self.page: ChromiumPage | None = None
-        self.safe_email = email.replace('@', '_').replace('.', '_')
-
-    def _make_page(self) -> ChromiumPage:
-        co = ChromiumOptions()
-        if os.path.exists('/usr/bin/google-chrome'):
-            co.set_browser_path('/usr/bin/google-chrome')
-        for arg in ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-popup-blocking', '--window-size=1280,1024']:
-            co.set_argument(arg)
-        co.headless(False)
-        co.set_user_data_path(os.path.join(os.getcwd(), 'browser_profile', self.safe_email))
-        if self.proxy:
-            proxy_url = self.proxy if "://" in self.proxy else f"socks5://{self.proxy}"
-            co.set_argument(f'--proxy-server={proxy_url}')
-            log(f"🌐 代理已配置: {proxy_url}")
-        return ChromiumPage(co)
-
-    def _is_logged_in(self) -> bool:
-        if not self.page: 
+# 更新cookie到secrets
+def update_github_secret(secret_name, new_value):
+    if not new_value:
+        print(f"⚠️ 跳过更新 {secret_name}：新值为空")
+        return False
+    masked = new_value[:4] + "..." + new_value[-4:] if len(new_value) > 8 else "***"
+    print(f"🔄 更新 Secret: {secret_name} (新值: {masked})")
+    try:
+        env = os.environ.copy()
+        if GH_TOKEN:
+            env["GH_TOKEN"] = GH_TOKEN
+        proc = subprocess.run(
+            ["gh", "secret", "set", secret_name, "--body", new_value],
+            capture_output=True, text=True, timeout=30, check=False,
+            env=env
+        )
+        if proc.returncode == 0:
+            return True
+        else:
+            print(f"❌ 更新失败: {proc.stderr.strip()}")
             return False
-        try:
-            url = self.page.url.lower()
-            if "bot-hosting.net" in url and "discord.com" not in url:
-                if "/a" in url:
-                    if self.page.ele('xpath://a[contains(@href, "/a") and (contains(., "Overview") or contains(., "Billing"))]', timeout=2):
-                        return True
-                if "/login/welcome" in url:
-                    return True
-        except Exception:
-            pass
+    except Exception as e:
+        print(f"❌ 异常: {e}")
         return False
 
-    def login(self) -> bool:
-        log(f"🔐 [{self.email}] 正在使用 Discord Token 免密登录...")
-        self.page = self._make_page()
-        page = self.page
-        solver = TurnstileSolver(page)
+# 发送tg通知
+def send_telegram_message(message: str):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("⚠️ Telegram 未配置，跳过通知")
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
+        print("✅ Telegram 通知已发送")
+    except Exception as e:
+        print(f"❌ Telegram 发送失败: {e}")
 
-        try:
-            page.get(self.NEW_PANEL_URL)
-            time.sleep(3)
-            if self._is_logged_in():
-                log(f"✨ [{self.email}] 会话未过期，已直接进入新版控制面板。")
-                return True
-
-            log("🌐 初始化 Discord 环境并注入 Token...")
-            page.get("https://discord.com/404")
-            time.sleep(2)
-
-            inject_js = f"""
-            function login(token) {{
-                setInterval(() => {{
-                    document.body.appendChild(document.createElement('iframe')).contentWindow.localStorage.token = `"${{token}}"`;
-                }}, 50);
-                setTimeout(() => location.reload(), 1500);
-            }}
-            login('{self.discord_token}');
-            """
-            page.run_js(inject_js)
-            time.sleep(4)
-
-            log("🚀 前往 bot-hosting 触发鉴权...")
-            page.get(self.LOGIN_URL)
-            time.sleep(5)
-            solver.solve()
-
-            discord_btn = (
-                page.ele('xpath://*[contains(text(), "Continue with Discord")]', timeout=3) or
-                page.ele('xpath://*[contains(text(), "Login with Discord")]') or
-                page.ele('xpath://a[contains(@href, "discord.com/oauth2")]')
-            )
-            if discord_btn:
-                log("🔄 检测到 'Continue with Discord' 按钮，执行点击...")
-                try:
-                    discord_btn.click()
-                except:
-                    page.run_js("arguments[0].click();", discord_btn)
-
-            # 等待授权页
-            for _ in range(15):
-                if "oauth2/authorize" in page.url:
-                    break
-                time.sleep(1)
-
-            if "oauth2/authorize" in page.url:
-                log("🔓 已免密来到 Discord 授权界面，正在自动点击授权...")
-                for attempt in range(3):
-                    auth_btn = page.ele('xpath://button[contains(., "授权") or contains(., "Authorize")]', timeout=3)
-                    if auth_btn:
-                        try:
-                            auth_btn.click(by_js=False)
-                        except:
-                            page.run_js("arguments[0].click();", auth_btn)
-                    for _ in range(12):
-                        time.sleep(1)
-                        if self._is_logged_in():
-                            log("🎉 登录并授权大成功！")
-                            return True
-                    log(f"⚠️ 第 {attempt+1} 次尝试失败...")
-
-            if self._is_logged_in():
-                log(f"🎉 [{self.email}] 登录成功！")
-                return True
-
-            log(f"❌ [{self.email}] 登录失败，当前 URL: {page.url}")
-            pic = _screenshot(page, f"err_login_{self.safe_email}.png")
-            send_tg_photo(self.tg_token, self.tg_chat_id, pic, f"❌ <b>{self.email}</b> 登录失败")
-            return False
-
-        except Exception as e:
-            log(f"❌ 登录逻辑异常: {e}")
-            return False
-
-    def renew_service(self) -> dict:
-        page = self.page
-        result = {'success': False, 'message': '', 'due_date': 'N/A', 'btn_text': ''}
-
-        log(f"🧭 正在直达账单页面: {self.BILLING_URL}")
-        page.get(self.BILLING_URL)
-        time.sleep(5)
-        TurnstileSolver(page).solve()
-
-        # 提取到期时间
-        try:
-            m = re.search(r'Expires\s+(\d{1,4}[-/]\d{1,2}[-/]\d{1,4})', page.html, re.IGNORECASE)
-            if m:
-                result['due_date'] = m.group(1)
-                log(f"📅 当前到期日: {result['due_date']}")
-        except Exception as e:
-            log(f"⚠️ 解析到期时间失败: {e}")
-
-        # === 核心修复部分：适配新按钮 "Renew (+4d)" ===
-        renew_ele = None
-        btn_text = ""
-
-        elements = page.eles('xpath://*[contains(translate(text(), "RENEW", "renew"), "renew")]')
-        for el in elements:
-            txt = el.text.strip()
-            if not txt:
-                continue
-            if "manually to extend" in txt.lower():
-                continue
-
-            if ("renew in" in txt.lower() or 
-                txt.lower().startswith("renew") or 
-                "(+4d)" in txt):
-                renew_ele = el
-                btn_text = txt
-                result['btn_text'] = txt
-                log(f"✅ 找到续期按钮: {txt}")
-                break
-
-        if not renew_ele:
-            result['message'] = '未找到续期按钮'
-            log("❌ 未找到有效续期按钮")
-            log("🔍 页面中所有含renew的元素:")
-            for el in elements:
-                log(f"   - {el.text.strip()}")
-        elif "renew in" in btn_text.lower():
-            log(f"⏳ 冷却中: {btn_text}")
-            try:
-                renew_ele.click()
-            except:
-                page.run_js("arguments[0].click();", renew_ele)
-            result['message'] = f'冷却中 ({btn_text})，已执行点击'
+# 通知格式
+def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if '@' in EMAIL:
+        name, domain = EMAIL.split('@', 1)
+        if len(name) > 4:
+            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
         else:
-            # 可立即续期
-            log(f"⚡ 点击续期: {btn_text}")
+            masked_email = f"{name}@{domain}"
+    else:
+        masked_email = EMAIL[:2] + '****' 
+    
+    lines = [
+        "🇫🇮 Bot-hosting 续期通知",
+        "",
+        f"{status}",
+        f"👤 登录账户: {masked_email}",
+    ]
+    if expiry_date:
+        lines.append(f"📅 到期时间: {expiry_date}")
+    if extra:
+        lines.append(extra)
+    if error:
+        lines.append(f"⚠️ 错误信息: {error}")
+    lines.append(f"⏱️ 登录时间: {now}")
+    return "\n".join(lines)
+
+# 等待Turnstile验证通过
+def wait_for_turnstile_pass(sb, timeout=30):
+    start = time.time()
+    cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
+    while time.time() - start < timeout:
+        page_lower = sb.get_page_source().lower()
+        if not any(x in page_lower for x in cf_indicators):
+            print("✅ Turnstile 验证已通过")
+            # sb.save_screenshot("turnstile_passed.png")
+            return True
+        sb.sleep(1)
+    print("❌ Turnstile 验证超时未通过")
+    return False
+    
+# 获取当前出口ip
+def get_current_ip(proxy_server: str = "") -> str:
+    proxies = None
+    if proxy_server:
+        proxies = {"http": proxy_server, "https": proxy_server}
+    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+    response.raise_for_status()
+    return response.text.strip()
+
+# 时间格式化
+def format_countdown(countdown_str: str) -> str:
+    try:
+        h, m, _ = countdown_str.split(':')
+        h = int(h)
+        m = int(m)
+        if h > 0:
+            return f"{h}h{m}min"
+        else:
+            return f"{m}min"
+    except:
+        return countdown_str
+
+# 获取过期日期
+def extract_expiry_date(page_source: str) -> str:
+    patterns = [
+        r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",   # Expires 2026/07/07
+        r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",   # Expires 07/07/2026 (MM/DD/YYYY)
+        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",        # 2026/07/07 - renew
+        r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",        # 07/07/2026 - renew
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, page_source)
+        if match:
+            date_str = match.group(1)
+            # 如果是 MM/DD/YYYY 格式，转换为 YYYY/MM/DD
+            if len(date_str.split('/')[-1]) == 4:  # 年份长度4
+                parts = date_str.split('/')
+                if len(parts[0]) == 2:  # 第一部分是2位（月）
+                    # 修正：将 MM/DD/YYYY 转为 YYYY/MM/DD
+                    return f"{parts[2]}/{parts[0]}/{parts[1]}"
+            return date_str
+    return None
+
+# 主流程
+def main():
+    print("#" * 25)
+    print("   Bot-hosting 自动续期")
+    print("#" * 25)
+
+    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
+
+    sb_kwargs = {"uc": True, "headless": HEADLESS}
+
+    if IS_PROXY:
+        print(f"🔗 挂载代理: {PROXY_SERVER}")
+        sb_kwargs["proxy"] = PROXY_SERVER
+    else:
+        print("🍭 未使用代理，直连访问")
+
+    with SB(**sb_kwargs) as sb:
+        try:
+            ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
+            print(f"📍 当前出口IP: {ip}")
+        except Exception as e:
+            print(f"⚠️ 获取出口 IP 失败: {e}")
+
+        print("🚀 启动浏览器...")
+        sb.open("https://bot-hosting.net/")
+        sb.wait_for_ready_state_complete()
+        sb.sleep(2)
+
+        print("📝 注入 Cookie...")
+        for name, value in COOKIES.items():
+            if value:
+                sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
+
+        print("🌐 访问 https://bot-hosting.net/a/billings ...")
+        sb.open("https://bot-hosting.net/a/billings")
+        sb.wait_for_ready_state_complete()
+        sb.sleep(3)
+        current_url = sb.get_current_url()
+        current_title = sb.get_title()
+        print(f"📝 当前URL: {current_url}, Title: {current_title}")
+        if current_title != "Bot-Hosting.net | A Free Host For Discord Bots" or current_url != "https://bot-hosting.net/a/billings":
+            print(f"❌ 登录失败，当前标题: {current_title}")
+            send_telegram_message(format_notification("❌ 登录失败", error="Cookie 已失效或页面异常"))
+            return
+        print(f"✅ 登录成功,当前已到达账单页")
+
+        # 提取当前到期日期
+        page_source = sb.get_page_source()
+        current_expiry = extract_expiry_date(page_source)
+        if current_expiry:
+            print(f"📅 当前到期日期: {current_expiry}")
+        else:
+            print("⚠️ 未能提取当前到期日期")
+
+        # 寻找外部续期按钮
+        outer_renew_selector = None
+        countdown_text = None
+        possible_selectors = [
+            'button:contains("Renew")',
+            'a:contains("Renew")',
+            '[class*="renew"]',
+            '[class*="Renew"]',
+        ]
+
+        for selector in possible_selectors:
             try:
-                renew_ele.click()
-            except:
-                page.run_js("arguments[0].click();", renew_ele)
-
-            time.sleep(4)
-
-            # 确认弹窗
-            confirm_btn = page.ele('xpath://button[contains(translate(text(),"CONFIRM","confirm"), "confirm") or contains(translate(text(),"YES","yes"), "yes")]', timeout=3)
-            if confirm_btn:
-                log("📦 点击确认...")
-                try:
-                    confirm_btn.click()
-                except:
-                    page.run_js("arguments[0].click();", confirm_btn)
-                time.sleep(4)
-
-            result['success'] = True
-            result['message'] = f'已点击续期按钮 ({btn_text})'
-
-            # 验证更新
-            page.refresh()
-            time.sleep(5)
-            try:
-                m_after = re.search(r'Expires\s+(\d{1,4}[-/]\d{1,2}[-/]\d{1,4})', page.html, re.IGNORECASE)
-                if m_after and m_after.group(1) != result['due_date']:
-                    result['message'] += f" ✅ 到期日更新至 {m_after.group(1)}"
-                    result['due_date'] = m_after.group(1)
-            except:
+                if sb.is_element_visible(selector):
+                    button_text = sb.get_text(selector)
+                    if "Renew in" in button_text:
+                        match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", button_text)
+                        if match:
+                            countdown_text = match.group(1)
+                        break
+                    elif "Renew" in button_text and "in" not in button_text.lower():
+                        outer_renew_selector = selector
+                        print(f"✅ 续期按钮可用: '{button_text}'")
+                        break
+            except Exception as e:
                 pass
 
-        # 发送报告
-        pic = _screenshot(page, f"renew_result_{self.safe_email}.png")
-        status_icon = "✅" if result['success'] else "❌"
-        caption = (
-            f"{status_icon} <b>Bot-Hosting 续期报告</b>\n"
-            f"👤 账号：{self.email}\n"
-            f"📅 到期：{result['due_date']}\n"
-            f"🔘 按钮：{result['btn_text'] or '未捕获'}\n"
-            f"📝 状态：{result['message']}"
-        )
-        send_tg_photo(self.tg_token, self.tg_chat_id, pic, caption)
-        return result
-
-    def run(self):
-        try:
-            if not self.login():
+        # 点击外部续期按钮等待弹窗
+        if outer_renew_selector:
+            print("🔄 点击外部续期按钮，等待验证窗口...")
+            try:
+                sb.click(outer_renew_selector)
+                sb.sleep(3)  # 等待模态框加载
+            except Exception as e:
+                print(f"❌ 点击外部按钮失败: {e}")
+                send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
                 return
-            self.renew_service()
-        except Exception as e:
-            log(f"❌ 脚本异常: {e}")
-            if self.page:
-                pic = _screenshot(self.page, f"err_crash_{self.safe_email}.png")
-                send_tg_photo(self.tg_token, self.tg_chat_id, pic, f"❌ <b>{self.email}</b> 脚本崩溃\n{str(e)[:200]}")
-        finally:
-            if self.page:
-                self.page.quit()
 
+            # 处理弹窗中的 Turnstile
+            print("🔒 检测弹窗中的 Turnstile 验证...")
+            turnstile_passed = False
+            for attempt in range(1, 4):
+                try:
+                    sb.uc_gui_click_captcha()
+                    time.sleep(8)
+                except Exception as e:
+                    print(f"⚠️ 点击 Turnstile 出错: {e}")
 
-def main():
-    accounts_raw = os.getenv('ACCOUNTS', '').strip()
-    tg_token = os.getenv('TG_BOT_TOKEN', '').strip()
-    tg_chat_id = os.getenv('TG_CHAT_ID', '').strip()
-    proxy = os.getenv('PROXY', '').strip()
+                if wait_for_turnstile_pass(sb, timeout=20):
+                    turnstile_passed = True
+                    break
+                else:
+                    print(f"⏳ 第 {attempt} 次未通过，重试点击...")
 
-    if not accounts_raw:
-        log("❌ ACCOUNTS 环境变量为空")
-        sys.exit(1)
+            if not turnstile_passed:
+                print("❌ Turnstile 验证最终未通过，脚本退出")
+                send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
+                return
 
-    accounts = parse_accounts(accounts_raw)
-    for email, token in accounts:
-        log(f"\n🚀 开始处理: {email}")
-        renewer = BotHostingRenewer(email, token, proxy, tg_token, tg_chat_id)
-        renewer.run()
+            # 点击续期按钮
+            print("⏳ 等待续期按钮可用并点击...")
+            time.sleep(3) 
 
-    log("🏁 全部账号处理完毕")
+            modal_button_clicked = False
+            try:
+                sb.click('button:contains("Renew for 4 days")', timeout=8)
+                modal_button_clicked = True
+                print("✅ 已点击续期按钮")
+            except Exception as e:
+                print(f"续期按钮点击失败: {e}")
 
+            print("⏳ 等待新的过期时间...")
+            sb.sleep(3)
 
-if __name__ == '__main__':
+            # 提取新的到期日期和倒计时
+            new_page_text = sb.get_page_source()
+            new_expiry = extract_expiry_date(new_page_text)
+            new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+            if new_match:
+                new_countdown = new_match.group(1)
+                print(f"✅ 续期成功！新的倒计时: {new_countdown}")
+                if new_expiry:
+                    print(f"📅 新的到期日期: {new_expiry}")
+                send_telegram_message(
+                    format_notification(
+                        "✅ 续期成功",
+                        extra=f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
+                        expiry_date=new_expiry or "（未获取到）"
+                    )
+                )
+            else:
+                if new_expiry and new_expiry != current_expiry:
+                    print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
+                    send_telegram_message(
+                        format_notification(
+                            "✅ 续期成功",
+                            extra="到期日期已更新",
+                            expiry_date=new_expiry
+                        )
+                    )
+                else:
+                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
+                    send_telegram_message(
+                        format_notification(
+                            "⚠️ 续期可能未成功",
+                            extra="请登录后台检查",
+                            expiry_date=current_expiry or "（未获取到）"
+                        )
+                    )
+
+        else:
+            if countdown_text:
+                friendly = format_countdown(countdown_text)
+                print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
+                send_telegram_message(
+                    format_notification(
+                        "⏳ 未到续期时间",
+                        extra=f"⏱️ 可续期时间: {friendly}后",
+                        expiry_date=current_expiry or "（未获取到）"
+                    )
+                )
+            else:
+                print("ℹ️ 未找到续期按钮或倒计时，状态未知")
+                send_telegram_message(
+                    format_notification(
+                        "ℹ️ 无需续期",
+                        extra="当前状态未知，请手动检查",
+                        expiry_date=current_expiry or "（未获取到）"
+                    )
+                )
+
+        # 更新SESSION_TOKEN 
+        print("🔄 检查 SESSION_TOKEN 是否需要更新")
+        new_token, token_expiry = get_cookie_info(sb, "session_token")
+        old_token = SESSION_TOKEN
+
+        if should_update_cookie(new_token, old_token, token_expiry):
+            print("🔄 SESSION_TOKEN 需要更新")
+            if GH_TOKEN:
+                if update_github_secret("SESSION_TOKEN", new_token):
+                    print("✅ SESSION_TOKEN 更新成功")
+                else:
+                    print("⚠️ 更新失败，请检查 GH_TOKEN 权限")
+            else:
+                print("⚠️ 未设置 GH_TOKEN，无法自动更新")
+                print(f"📋 请手动设置 SESSION_TOKEN = {new_token[:4]}...{new_token[-4:]}")
+        else:
+            print("✅ SESSION_TOKEN 无需更新")
+        
+        print("🏁 脚本执行完毕")
+
+if __name__ == "__main__":
     main()
