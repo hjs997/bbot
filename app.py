@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 import os, re, sys, time, json, requests, subprocess
 import urllib.request, urllib.parse, urllib.error
 from datetime import datetime
 from seleniumbase import SB
 
 # 环境变量配置(可以直接私库在双引号里填写)
-EMAIL = os.environ.get("EMAIL") or "" # 邮箱,只用于通知使用，可随意填写
-SESSION_TOKEN = os.environ.get("SESSION_TOKEN") or "" # session token，默认登录方式,非必须
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or "" # Discord Token 备用登录方式, 失败时才使用,必须填写
-GH_TOKEN = os.environ.get("GH_TOKEN") or "" # GitHub PAT token,用于自动更新session token,可选
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or "" # TG chat id,不填写不通知，需和bot token一起填写生效
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or "" # TG bot token
+EMAIL         = os.environ.get("EMAIL") or ""           # 邮箱,只用于通知使用，可随意填写
+SESSION_TOKEN = os.environ.get("SESSION_TOKEN") or ""   # session token，默认登录方式,非必须
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用登录方式, 失败时才使用,必须填写
+GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
+TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
+TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
 
 # 解析 DISCORD_TOKEN
 DC_TOKEN = ""
@@ -104,8 +105,8 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
         else:
             masked_email = f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****'
-   
+        masked_email = EMAIL[:2] + '****' 
+    
     lines = [
         "🇫🇮 Bot-hosting 续期通知",
         "",
@@ -126,16 +127,17 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
 # 等待Turnstile验证通过
 def wait_for_turnstile_pass(sb, timeout=30):
     start = time.time()
-    cf_indicators = ["verify you are human", "確認您是真人", "troubleshoot", "just a moment"]
+    cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
     while time.time() - start < timeout:
         page_lower = sb.get_page_source().lower()
         if not any(x in page_lower for x in cf_indicators):
             print("✅ Turnstile 验证已通过")
+            # sb.save_screenshot("turnstile_passed.png")
             return True
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
     return False
-   
+    
 # 获取当前出口ip
 def get_current_ip(proxy_server: str = "") -> str:
     proxies = None
@@ -161,10 +163,10 @@ def format_countdown(countdown_str: str) -> str:
 # 获取过期日期
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
-        r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})", # Expires 2026/07/07
-        r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", # Expires 07/07/2026 (MM/DD/YYYY)
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew", # 2026/07/07 - renew
-        r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew", # 07/07/2026 - renew
+        r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",   # Expires 2026/07/07
+        r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",   # Expires 07/07/2026 (MM/DD/YYYY)
+        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",        # 2026/07/07 - renew
+        r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",        # 07/07/2026 - renew
         r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew manually to extend for 4 days", # 2026/07/07 - renew manually to extend for 4 days
     ]
     for pattern in patterns:
@@ -172,70 +174,79 @@ def extract_expiry_date(page_source: str) -> str:
         if match:
             date_str = match.group(1)
             # 如果是 MM/DD/YYYY 格式，转换为 YYYY/MM/DD
-            if len(date_str.split('/')[-1]) == 4: # 年份长度4
+            if len(date_str.split('/')[-1]) == 4:  # 年份长度4
                 parts = date_str.split('/')
-                if len(parts[0]) == 2: # 第一部分是2位（月）
+                if len(parts[0]) == 2:  # 第一部分是2位（月）
+                    # 修正：将 MM/DD/YYYY 转为 YYYY/MM/DD
                     return f"{parts[2]}/{parts[0]}/{parts[1]}"
             return date_str
     return None
 
-# Discord OAuth 登录（SESSION_TOKEN 失效时的备用方案）
-DISCORD_CLIENT_ID = "884382422530158623"
-OAUTH_REDIRECT_URI = "https://bot-hosting.net/login"
-OAUTH_SCOPE = "identify email guilds"
-DISCORD_API = "https://discord.com/api/v9/oauth2/authorize"
+#   Discord OAuth 登录（SESSION_TOKEN 失效时的备用方案）
+DISCORD_CLIENT_ID   = "884382422530158623"
+OAUTH_REDIRECT_URI  = "https://bot-hosting.net/login"
+OAUTH_SCOPE         = "identify email guilds"
+DISCORD_API         = "https://discord.com/api/v9/oauth2/authorize"
 DISCORD_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 )
 STATE_RE = re.compile(r"[?&]state=([^&]+)")
 
+
 def capture_discord_state(sb) -> str:
     """打开 /login/discord，从落地页 URL 里提取本次会话的 state"""
     print("🔎 获取 Discord OAuth state...")
     sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", reconnect_time=4)
     time.sleep(2)
+
     url = sb.get_current_url()
     if "discord.com" not in url:
         print(f"⚠️ 未跳转到 Discord 相关页面，当前 URL：{url}")
         return ""
+
     m = STATE_RE.search(url)
     if not m:
         print(f"❌ 未能从 URL 中解析出 state，当前 URL：{url}")
         return ""
+
     state = urllib.parse.unquote(m.group(1))
     print(f"✅ 已捕获 state（当前落地页：{urllib.parse.urlparse(url).path}）")
     return state
 
+
 def discord_authorize(state: str) -> str:
     """用 DC_TOKEN 直接完成 Discord 侧授权，返回跳转回 bot-hosting.net 的 location"""
     query = urllib.parse.urlencode({
-        "client_id": DISCORD_CLIENT_ID,
+        "client_id":     DISCORD_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": OAUTH_REDIRECT_URI,
-        "scope": OAUTH_SCOPE,
-        "state": state,
+        "redirect_uri":  OAUTH_REDIRECT_URI,
+        "scope":         OAUTH_SCOPE,
+        "state":         state,
     })
     authorize_url = f"{DISCORD_API}?{query}"
+
     referer = (
         "https://discord.com/oauth2/authorize?" +
         urllib.parse.urlencode({
-            "client_id": DISCORD_CLIENT_ID,
-            "redirect_uri": OAUTH_REDIRECT_URI,
+            "client_id":     DISCORD_CLIENT_ID,
+            "redirect_uri":  OAUTH_REDIRECT_URI,
             "response_type": "code",
-            "scope": OAUTH_SCOPE,
-            "state": state,
+            "scope":         OAUTH_SCOPE,
+            "state":         state,
         })
     )
+
     headers = {
-        "accept": "*/*",
-        "authorization": DC_TOKEN,
-        "content-type": "application/json",
-        "origin": "https://discord.com",
-        "referer": referer,
-        "user-agent": DISCORD_UA,
+        "accept":           "*/*",
+        "authorization":    DC_TOKEN,
+        "content-type":     "application/json",
+        "origin":           "https://discord.com",
+        "referer":          referer,
+        "user-agent":       DISCORD_UA,
         "x-discord-locale": "zh-CN",
     }
+
     body = json.dumps({
         "permissions": "0",
         "authorize": True,
@@ -246,12 +257,14 @@ def discord_authorize(state: str) -> str:
             "channel_type": 10000,
         },
     })
+
     # 如果配置了代理，Discord API 请求也走代理
     proxies = None
     _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     if _is_proxy:
         proxies = {"http": _proxy_server, "https": _proxy_server}
+
     try:
         resp = requests.post(authorize_url, headers=headers, data=body, proxies=proxies, timeout=20)
         if resp.status_code != 200:
@@ -261,36 +274,46 @@ def discord_authorize(state: str) -> str:
     except Exception as e:
         print(f"❌ Discord OAuth2 授权异常: {e}")
         return ""
+
     location = resp_data.get("location", "")
     if not location:
         print(f"❌ 授权响应中未找到 location 字段: {resp_data}")
         return ""
+
     masked = re.sub(r"code=[^&]+", "code=***", location)
     print(f"✅ 拿到回调 URL: {masked}")
     return location
 
+
 def do_discord_login(sb) -> bool:
     """通过 Discord Token 走完整 OAuth 流程登录 bot-hosting.net"""
     print("\n🔑 通过 Discord Token 登录...")
+
     state = capture_discord_state(sb)
     if not state:
         sb.save_screenshot("login_no_state.png")
         return False
+
     location = discord_authorize(state)
     if not location:
         return False
+
     print("↩️ 携带授权码打开回调链接...")
     sb.uc_open_with_reconnect(location, reconnect_time=4)
     time.sleep(3)
+
     url = sb.get_current_url()
+
     if "/error/banned" in url:
         print("🚫 账号已被封禁")
         sb.save_screenshot("login_banned.png")
         return False
+
     if "bot-hosting.net" not in url:
         print(f"❌ 回调后未跳转至 bot-hosting.net，当前 URL：{url}")
         sb.save_screenshot("login_no_redirect.png")
         return False
+
     try:
         body_text = sb.get_text("body")
     except Exception:
@@ -299,6 +322,7 @@ def do_discord_login(sb) -> bool:
         print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
         sb.save_screenshot("login_fraud.png")
         return False
+
     for _ in range(30):
         url = sb.get_current_url()
         path = urllib.parse.urlparse(url).path
@@ -306,6 +330,7 @@ def do_discord_login(sb) -> bool:
             print(f"✅ Discord OAuth 登录成功！当前页面：{url}")
             return True
         time.sleep(0.5)
+
     print(f"❌ 登录超时或未跳转成功，最终停留在：{url}")
     try:
         body_text = sb.get_text("body")
@@ -315,38 +340,48 @@ def do_discord_login(sb) -> bool:
     sb.save_screenshot("login_timeout.png")
     return False
 
+
 # 主流程
 def main():
     print("#" * 25)
-    print(" Bot-hosting 自动续期")
+    print("   Bot-hosting 自动续期")
     print("#" * 25)
+
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
     PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
+    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
+
     sb_kwargs = {"uc": True, "headless": HEADLESS}
+
     if IS_PROXY:
         print(f"🔗 挂载代理: {PROXY_SERVER}")
         sb_kwargs["proxy"] = PROXY_SERVER
     else:
         print("🍭 未使用代理，直连访问")
+
     global _LOGIN_METHOD
+
     with SB(**sb_kwargs) as sb:
         try:
             ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
             print(f"📍 当前出口IP: {ip}")
         except Exception as e:
             print(f"⚠️ 获取出口 IP 失败: {e}")
+
         login_ok = False
+
         # 方式1: SESSION_TOKEN Cookie 登录（默认）
         if SESSION_TOKEN:
             print("🚀 启动浏览器...")
             sb.open("https://bot-hosting.net/")
             sb.wait_for_ready_state_complete()
             sb.sleep(2)
+
             print("📝 注入 Cookie...")
             for name, value in COOKIES.items():
                 if value:
                     sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
+
             print("🌐 访问 https://bot-hosting.net/a/billings ...")
             sb.open("https://bot-hosting.net/a/billings")
             sb.wait_for_ready_state_complete()
@@ -354,12 +389,12 @@ def main():
             current_url = sb.get_current_url()
             current_title = sb.get_title()
             print(f"📝 当前URL: {current_url}, Title: {current_title}")
-            # 改进登录成功判断：只要在 /a/billings 且没有重定向到 login 就算成功
-            if "/a/billings" in current_url and "login" not in current_url.lower():
+
+            if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
                 login_ok = True
-                print("✅ SESSION_TOKEN 登录成功，已到达账单页")
+                print("✅ SESSION_TOKEN 登录成功, 当前已到达账单页")
             else:
-                print(f"❌ SESSION_TOKEN 登录失败，当前标题: {current_title}")
+                print(f"❌ SESSION_TOKEN 登录失败，当前URL: {current_url}, 当前标题: {current_title}")
 
         # 方式2: Discord OAuth 登录（备用）
         if not login_ok and DC_TOKEN:
@@ -373,10 +408,10 @@ def main():
                 current_url = sb.get_current_url()
                 current_title = sb.get_title()
                 print(f"📝 当前URL: {current_url}, Title: {current_title}")
-                # 改进登录成功判断
-                if "/a/billings" in current_url and "login" not in current_url.lower():
+
+                if "a/billings" in current_url:
                     login_ok = True
-                    print("✅ Discord OAuth 登录成功，已到达账单页")
+                    print("✅ Discord OAuth 登录成功,当前已到达账单页")
                 else:
                     print(f"❌ Discord OAuth 登录后仍未到达账单页，当前URL: {current_url}")
             else:
@@ -413,6 +448,7 @@ def main():
             '[class*="renew"]',
             '[class*="Renew"]',
         ]
+
         for selector in possible_selectors:
             try:
                 if sb.is_element_visible(selector):
@@ -435,7 +471,7 @@ def main():
             try:
                 sb.sleep(2)
                 sb.click(outer_renew_selector)
-                sb.sleep(15) # 等待模态框加载，可能因网络因素加载慢
+                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
             except Exception as e:
                 print(f"❌ 点击外部按钮失败: {e}")
                 send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
@@ -450,11 +486,13 @@ def main():
                     time.sleep(12)
                 except Exception as e:
                     print(f"⚠️ 点击 Turnstile 出错: {e}")
+
                 if wait_for_turnstile_pass(sb, timeout=20):
                     turnstile_passed = True
                     break
                 else:
                     print(f"⏳ 第 {attempt} 次未通过，重试点击...")
+
             if not turnstile_passed:
                 print("❌ Turnstile 验证最终未通过，脚本退出")
                 send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
@@ -462,7 +500,8 @@ def main():
 
             # 点击续期按钮
             print("⏳ 等待续期按钮可用并点击...")
-            time.sleep(5)
+            time.sleep(5) 
+
             modal_button_clicked = False
             try:
                 sb.click('button:contains("Renew for 4 days")', timeout=8)
@@ -509,6 +548,7 @@ def main():
                             expiry_date=current_expiry or "（未获取到）"
                         )
                     )
+
         else:
             if countdown_text:
                 friendly = format_countdown(countdown_text)
@@ -530,10 +570,11 @@ def main():
                     )
                 )
 
-        # 更新SESSION_TOKEN
+        # 更新SESSION_TOKEN 
         print("🔄 检查 SESSION_TOKEN 是否需要更新")
         new_token, token_expiry = get_cookie_info(sb, "session_token")
         old_token = SESSION_TOKEN
+
         if should_update_cookie(new_token, old_token, token_expiry):
             print("🔄 SESSION_TOKEN 需要更新")
             if GH_TOKEN:
@@ -546,7 +587,7 @@ def main():
                 print(f"📋 请手动设置 SESSION_TOKEN = {new_token[:4]}...{new_token[-4:]}")
         else:
             print("✅ SESSION_TOKEN 无需更新")
-       
+        
         print("🏁 脚本执行完毕")
 
 if __name__ == "__main__":
