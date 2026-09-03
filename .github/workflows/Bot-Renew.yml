@@ -10,16 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
-      contents: write   # 必须有 write 权限才能 commit time.txt
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
-        with:
-          # 使用 PAT 才能触发后续 workflow（可选，若只用 github.token 也可以只更新文件）
-          token: ${{ secrets.GH_TOKEN || github.token }}
+      - uses: actions/checkout@v6
 
       - name: ⚙ 设置 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -31,6 +28,7 @@ jobs:
           seleniumbase install chromedriver
 
       - name: ⚙ 设置代理 (sing-box)
+        continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
@@ -46,7 +44,29 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           xvfb-run --auto-servernum python3 app.py
+  
+      # ⏱️ 提交 time.txt 到仓库(用于解决60天无文件变化的限制)
+      - name: Commit time.txt to repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          if [ ! -f time.txt ]; then
+            echo "首次生成时间：$(date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          else
+            echo "$(date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          fi
+
+          git add time.txt
+
+          if git diff --cached --quiet; then
+            echo "无变化，无需提交"
+          else
+            git commit -m "⏱️ 更新时间文件: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin HEAD:main
+          fi
       - name: 🧽 清理进程和临时文件
         if: always()
         run: |
@@ -55,25 +75,6 @@ jobs:
           pkill -f chrome || true
           pkill -f Xvfb || true
           rm -f sing-box sing-box-config.json sing-box.log
-
-      # ========== 防止 60 天无活动禁用 workflow ==========
-      - name: 📅 更新 time.txt 保持仓库活跃
-        if: always()
-        run: |
-          echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" > time.txt
-          echo "# 此文件由 GitHub Actions 自动更新，用于防止仓库 60 天无活动导致 scheduled workflow 被禁用" >> time.txt
-          echo "# Auto-updated by GitHub Actions to prevent scheduled workflows from being disabled after 60 days of inactivity" >> time.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add time.txt
-          # 只有内容变化时才 commit（避免空 commit）
-          if git diff --staged --quiet; then
-            echo "time.txt 无变化，跳过 commit"
-          else
-            git commit -m "chore: update time.txt to keep workflow alive [skip ci]"
-            git push
-            echo "✅ time.txt 已更新并推送"
-          fi
 
       - name: 🧹 清理旧的工作流运行记录
         if: always()
